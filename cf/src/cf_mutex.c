@@ -55,9 +55,27 @@ sys_futex(void *uaddr, int op, int val)
 	syscall(SYS_futex, uaddr, op, val, NULL, NULL, 0);
 }
 
-#define xchg(__ptr, __val) __sync_lock_test_and_set(__ptr, __val)
-#define cmpxchg(__ptr, __cmp, __set) __sync_val_compare_and_swap(__ptr, __cmp, __set)
+#define xchg_acq(__ptr, __val) __sync_lock_test_and_set(__ptr, __val)
+/* use this as __sync_lock_release returns void */
+/* not so sure that the atomic instructions are necessary, buuuutttt */
+static inline uint32_t __xchg_rel(volatile void* __ptr, uint32_t __val) 
+{                                                                       
+        uint32_t ret_val;                                              
+__asm__ __volatile__(                                                 
+"       lwsync  \t\n"                                                
+"LX%=:     lwarx     %0,0,%1  \t\n"                                   
+"       stwcx.     %2,0,%1  \t\n"                                 
+"       bne      0,LX%=  \t\n" 
+        : "=r" (ret_val)                                     
+        : "r" (__ptr), "r" (__val)                   
+        : );                                             
+        return ret_val;                                
+}
 
+#define xchg_rel(__ptr, __val) __xchg_rel(__ptr, __val)
+
+#define cmpxchg_acq(__ptr, __cmp, __set) __atomic_compare_exchange_n((__ptr), (__cmp), (__set), false, __ATOMIC_ACQUIRE, __ATOMIC_ACQUIRE)
+#define cmpxchg_rel(__ptr, __cmp, __set) __atomic_compare_exchange_n(__ptr, __cmp, __set, false, __ATOMIC_RELEASE, __ATOMIC_RELAXED)
 #if defined(__powerpc64__)
 #include <sys/platform/ppc.h>
 #define cpu_relax() __ppc_get_timebase()
@@ -76,7 +94,9 @@ sys_futex(void *uaddr, int op, int val)
 void
 cf_mutex_lock(cf_mutex *m)
 {
-	if (likely(cmpxchg((uint32_t *)m, 0, 1) == 0)) {
+	uint32_t expt = 0;
+	
+	if (likely(cmpxchg_acq((uint32_t *)m, &expt, 1) == true)) {
 		return; // was not locked
 	}
 
@@ -84,7 +104,7 @@ cf_mutex_lock(cf_mutex *m)
 		sys_futex(m, FUTEX_WAIT_PRIVATE, 2);
 	}
 
-	while (xchg((uint32_t *)m, 2) != 0) {
+	while (xchg_acq((uint32_t *)m, 2) != 0) {
 		sys_futex(m, FUTEX_WAIT_PRIVATE, 2);
 	}
 }
@@ -92,7 +112,7 @@ cf_mutex_lock(cf_mutex *m)
 void
 cf_mutex_unlock(cf_mutex *m)
 {
-	uint32_t check = xchg((uint32_t *)m, 0);
+	uint32_t check = xchg_rel((uint32_t *)m, 0);
 
 	if (unlikely(check == 2)) {
 		sys_futex(m, FUTEX_WAKE_PRIVATE, 1);
@@ -106,7 +126,9 @@ cf_mutex_unlock(cf_mutex *m)
 bool
 cf_mutex_trylock(cf_mutex *m)
 {
-	if (cmpxchg((uint32_t *)m, 0, 1) == 0) {
+	uint32_t expt = 0;
+	
+	if (cmpxchg_acq((uint32_t *)m, &expt, 1) == true) {
 		return true; // was not locked
 	}
 
@@ -116,8 +138,10 @@ cf_mutex_trylock(cf_mutex *m)
 void
 cf_mutex_lock_spin(cf_mutex *m)
 {
+	uint32_t expt = 0;
+	
 	for (int i = 0; i < FUTEX_SPIN_MAX; i++) {
-		if (cmpxchg((uint32_t *)m, 0, 1) == 0) {
+		if (cmpxchg_acq((uint32_t *)m, &expt, 1) == true) {
 			return; // was not locked
 		}
 
@@ -128,7 +152,7 @@ cf_mutex_lock_spin(cf_mutex *m)
 		sys_futex(m, FUTEX_WAIT_PRIVATE, 2);
 	}
 
-	while (xchg((uint32_t *)m, 2) != 0) {
+	while (xchg_acq((uint32_t *)m, 2) != 0) {
 		sys_futex(m, FUTEX_WAIT_PRIVATE, 2);
 	}
 }
@@ -136,13 +160,14 @@ cf_mutex_lock_spin(cf_mutex *m)
 void
 cf_mutex_unlock_spin(cf_mutex *m)
 {
-	uint32_t check = xchg((uint32_t *)m, 0);
+	uint32_t expt = 1;
+	uint32_t check = xchg_rel((uint32_t *)m, 0);
 
 	if (unlikely(check == 2)) {
 		// Spin and hope someone takes the lock.
 		for (int i = 0; i < FUTEX_SPIN_MAX; i++) {
 			if (m->u32 != 0) {
-				if (cmpxchg((uint32_t *)m, 1, 2) == 0) {
+				if (cmpxchg_rel((uint32_t *)m, &expt, 2) == 0) {
 					break;
 				}
 
