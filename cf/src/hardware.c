@@ -478,6 +478,10 @@ read_value(const char *path, int64_t *val)
 	char *end;
 	int64_t x = strtol(buff, &end, 10);
 
+	if (x >= CPU_SETSIZE) {
+		x = CPU_SETSIZE - 1;
+	}
+
 	if (*end != '\0' || x >= CPU_SETSIZE) {
 		cf_warning(CF_HARDWARE, "invalid value \"%s\" in %s", buff, path);
 		return FILE_RES_ERROR;
